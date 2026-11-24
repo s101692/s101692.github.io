@@ -22,6 +22,7 @@
 
   <div class="box">Portfel: <b id="wallet">–</b></div>
   <button id="connect">Połącz z MetaMaskiem</button>
+  <button id="switchAccount">Wybierz inne konto</button>
   <div class="box" id="status">Nie połączono.</div>
 
   <section>
@@ -147,6 +148,18 @@
         }
       } catch (e) {
         status("Błąd: " + (e.shortMessage ?? e.message), "err");
+      }
+    };
+
+    // MetaMask udostępnia stronie tylko konta wskazane w oknie uprawnień. Ten przycisk otwiera je ponownie,
+    // żeby można było zaznaczyć kolejne konta (po zatwierdzeniu strona się odświeża).
+    $("switchAccount").onclick = async () => {
+      if (!window.ethereum) return status("Nie wykryto MetaMaska w tej przeglądarce.", "err");
+      try {
+        await window.ethereum.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
+        location.reload();
+      } catch (e) {
+        status("Nie zmieniono konta: " + (e.shortMessage ?? e.message), "err");
       }
     };
 
