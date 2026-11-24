@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Strażnik portfela</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; line-height: 1.5; }
+    button { font-size: 16px; padding: 10px 18px; margin: 8px 0; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .box { background: #f4f4f6; border-radius: 8px; padding: 12px 16px; margin: 12px 0; word-break: break-all; }
+    .warn { background: #fff4e5; border-left: 4px solid #e65100; }
+    .ok { color: #1a7f37; } .err { color: #c62828; }
+    textarea { width: 100%; height: 110px; font-family: monospace; font-size: 13px; box-sizing: border-box; }
+    code { font-size: 13px; }
+    section { border-top: 1px solid #ddd; margin-top: 28px; padding-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Strażnik portfela</h1>
+  <p>Strona do potwierdzania roli Strażnika oraz do zatwierdzania próśb właściciela podpisem w MetaMasku.</p>
+
+  <div class="box">Portfel: <b id="wallet">–</b></div>
+  <button id="connect">Połącz z MetaMaskiem</button>
+  <div class="box" id="status">Nie połączono.</div>
+
+  <section>
+    <h2>1. Potwierdzenie roli Strażnika</h2>
+    <button id="sign" disabled>Podpisz zgodę na rolę Strażnika</button>
+    <div id="result" hidden>
+      <p class="ok">Podpis gotowy. Skopiuj poniższy tekst i przekaż go przekaźnikowi.</p>
+      <textarea id="output" readonly></textarea>
+      <button id="copy">Kopiuj</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. Zatwierdzanie prośby właściciela</h2>
+    <p>Wklej tekst, który właściciel wysłał z aplikacji (prośba o odzyskanie klucza albo o jego anulowanie).</p>
+    <textarea id="requestInput" placeholder="Wklej tutaj całą wiadomość z aplikacji…" disabled></textarea>
+    <button id="check" disabled>Sprawdź prośbę</button>
+
+    <div id="summary" class="box" hidden></div>
+    <div id="requestWarning" class="box warn" hidden>
+      <b>Zanim podpiszesz:</b> skontaktuj się z właścicielem portfela innym kanałem
+      (telefon, osobiście) i potwierdź, że to on wysłał tę prośbę. Podpisując, pomagasz zmienić
+      klucz, który kontroluje jego środki. Jeśli nie masz pewności, nie podpisuj.
+    </div>
+    <button id="signRequest" disabled>Podpisz prośbę</button>
+
+    <div id="requestResult" hidden>
+      <p class="ok">Podpis gotowy. Skopiuj go i odeślij właścicielowi, który wklei go w aplikacji.</p>
+      <textarea id="requestOutput" readonly></textarea>
+      <button id="copyRequest">Kopiuj</button>
+    </div>
+  </section>
+
+  <script type="module">
+    import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.min.js";
+
+    // Tylko odczyty z kontraktu (bez wysyłania transakcji)
+    const ABI = [
+      "function isGuardian(address) view returns (bool)",
+      "function hasAccepted(address) view returns (bool)",
+      "function acceptNonce(address) view returns (uint256)",
+      "function recoveryNonce() view returns (uint256)",
+      "function pending() view returns (bytes32 newX, bytes32 newY, uint64 executeAfter)",
+    ];
+
+    // Ta sama treść zgody co w kontrakcie: GuardianAccept(address guardian,uint256 nonce)
+    const TYPES = {
+      GuardianAccept: [
+        { name: "guardian", type: "address" },
+        { name: "nonce", type: "uint256" },
+      ],
+    };
+
+    // Typy próśb właściciela. Strona używa WŁASNYCH definicji typów (nie tych z wklejonego tekstu),
+    // żeby wklejone dane nie mogły podmienić tego, co faktycznie jest podpisywane.
+    // Muszą odpowiadać kontraktowi: RECOVERY_TYPEHASH i CANCEL_RECOVERY_TYPEHASH.
+    const REQUEST_TYPES = {
+      Recovery: [
+        { name: "newOwnerX", type: "bytes32" },
+        { name: "newOwnerY", type: "bytes32" },
+        { name: "nonce", type: "uint256" },
+      ],
+      CancelRecovery: [{ name: "nonce", type: "uint256" }],
+    };
+
+    const NETWORKS = { 11155111: "Sepolia", 31337: "Hardhat (lokalnie)" };
+
+    const $ = (id) => document.getElementById(id);
+    const status = (html, cls = "") => { $("status").innerHTML = html; $("status").className = "box " + cls; };
+    const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+    // Adres portfela z linku
+    const walletParam = new URLSearchParams(location.search).get("wallet");
+    if (!walletParam || !ethers.isAddress(walletParam)) {
+      $("wallet").textContent = "brak lub zły adres w linku (?wallet=0x...)";
+      $("connect").disabled = true;
+    } else {
+      $("wallet").textContent = ethers.getAddress(walletParam);
+    }
+
+    // Opcjonalnie: link może zawierać gotową prośbę (?request=...)
+    const requestParam = new URLSearchParams(location.search).get("request");
+    if (requestParam) $("requestInput").value = requestParam;
+
+    let provider, signer, account, chainId, walletRead;
+    let preparedRequest = null; // sprawdzona prośba gotowa do podpisu
+
+    $("connect").onclick = async () => {
+      if (!window.ethereum) return status("Nie wykryto MetaMaska w tej przeglądarce. Na telefonie otwórz stronę w przeglądarce wbudowanej w aplikację MetaMask.", "err");
+      try {
+        provider = new ethers.BrowserProvider(window.ethereum);
+        await provider.send("eth_requestAccounts", []); // MetaMask zapyta, które konto połączyć
+        chainId = (await provider.getNetwork()).chainId;
+
+        // MetaMask pamięta sieć osobno dla każdej strony. Jeśli to nie Sepolia ani Hardhat, prosimy o przełączenie na Sepolię
+        if (!NETWORKS[Number(chainId)]) {
+          await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0xaa36a7" }] });
+          provider = new ethers.BrowserProvider(window.ethereum); // nowe połączenie po zmianie sieci
+          chainId = (await provider.getNetwork()).chainId;
+        }
+        const netName = NETWORKS[Number(chainId)];
+
+        signer = await provider.getSigner();
+        account = await signer.getAddress();
+
+        if ((await provider.getCode(walletParam)) === "0x")
+          return status(`Pod tym adresem nie ma portfela w sieci ${netName}. Sprawdź link i sieć w MetaMasku.`, "err");
+
+        walletRead = new ethers.Contract(walletParam, ABI, provider);
+        const invited = await walletRead.isGuardian(account);
+        const accepted = await walletRead.hasAccepted(account);
+
+        const who = `Konto: <b>${account}</b><br>Sieć: <b>${netName}</b><br>`;
+        if (!invited) return status(who + "To konto nie jest zaproszone na Strażnika tego portfela.", "err");
+
+        if (accepted) {
+          status(who + "To konto jest Strażnikiem tego portfela. Możesz zatwierdzać prośby właściciela poniżej.", "ok");
+          $("requestInput").disabled = false;
+          $("check").disabled = false;
+        } else {
+          status(who + "Jesteś zaproszony na Strażnika. Najpierw podpisz zgodę na rolę (punkt 1).");
+          $("sign").disabled = false;
+        }
+      } catch (e) {
+        status("Błąd: " + (e.shortMessage ?? e.message), "err");
+      }
+    };
+
+    // Zmiana konta albo sieci w MetaMasku: odśwież stronę, żeby nie podpisać starymi danymi
+    if (window.ethereum) {
+      window.ethereum.on("accountsChanged", () => location.reload());
+      window.ethereum.on("chainChanged", () => location.reload());
+    }
+
+    // ---------- 1. Zgoda na rolę Strażnika ----------
+    $("sign").onclick = async () => {
+      try {
+        const wallet = new ethers.Contract(walletParam, ABI, signer);
+        const domain = { name: "Portfel", version: "1", chainId, verifyingContract: ethers.getAddress(walletParam) };
+        const value = { guardian: account, nonce: await wallet.acceptNonce(account) };
+
+        // MetaMask pokaże okno z czytelną treścią zgody
+        const signature = await signer.signTypedData(domain, TYPES, value);
+
+        $("output").value = JSON.stringify({ guardian: account, signature }, null, 2);
+        $("result").hidden = false;
+        $("sign").disabled = true;
+      } catch (e) {
+        status("Podpis anulowany lub błąd: " + (e.shortMessage ?? e.message), "err");
+      }
+    };
+
+    $("copy").onclick = () => navigator.clipboard.writeText($("output").value);
+
+    // ---------- 2. Prośby właściciela: odzyskanie i anulowanie ----------
+
+    // Wyciąga JSON z wklejonej wiadomości (aplikacja dodaje do niego linijkę wprowadzenia) i go waliduje
+    function parseRequest(text) {
+      const start = text.indexOf("{");
+      const end = text.lastIndexOf("}");
+      if (start < 0 || end < start) throw new Error("Nie znaleziono danych prośby w wklejonym tekście.");
+
+      let req;
+      try { req = JSON.parse(text.slice(start, end + 1)); }
+      catch { throw new Error("Wklejone dane prośby są uszkodzone. Skopiuj wiadomość w całości."); }
+
+      const type = req.primaryType;
+      if (!REQUEST_TYPES[type]) throw new Error("Nieznany typ prośby: " + esc(type));
+
+      const d = req.domain ?? {};
+      if (d.name !== "Portfel" || String(d.version) !== "1") throw new Error("To nie jest prośba dla portfela tego typu.");
+      if (String(d.verifyingContract).toLowerCase() !== walletParam.toLowerCase())
+        throw new Error("Ta prośba dotyczy INNEGO portfela niż ten z linku. Nie podpisuj.");
+      if (BigInt(d.chainId) !== chainId)
+        throw new Error("Ta prośba dotyczy innej sieci niż ta wybrana w MetaMasku.");
+
+      const m = req.message ?? {};
+      if (!/^\d+$/.test(String(m.nonce))) throw new Error("Nieprawidłowy numer próby w prośbie.");
+
+      const message = { nonce: BigInt(m.nonce) };
+      if (type === "Recovery") {
+        for (const k of ["newOwnerX", "newOwnerY"]) {
+          if (!/^0x[0-9a-fA-F]{64}$/.test(String(m[k]))) throw new Error("Nieprawidłowy nowy klucz w prośbie.");
+          message[k] = m[k];
+        }
+      }
+      return { type, message };
+    }
+
+    $("check").onclick = async () => {
+      preparedRequest = null;
+      $("signRequest").disabled = true;
+      $("requestResult").hidden = true;
+      $("summary").hidden = true;
+      $("requestWarning").hidden = true;
+
+      const show = (html, cls = "") => { $("summary").innerHTML = html; $("summary").className = "box " + cls; $("summary").hidden = false; };
+      try {
+        const { type, message } = parseRequest($("requestInput").value);
+
+        // Prośba musi pasować do aktualnego stanu kontraktu, inaczej podpis byłby bezużyteczny
+        const currentNonce = await walletRead.recoveryNonce();
+        if (message.nonce !== currentNonce)
+          throw new Error(`Numer próby w prośbie (${message.nonce}) nie zgadza się z kontraktem (${currentNonce}). Poproś o nową prośbę z aplikacji.`);
+
+        const p = await walletRead.pending();
+        const hasPending = p.executeAfter !== 0n;
+        if (type === "Recovery" && hasPending) throw new Error("Odzyskiwanie już trwa. Nowa prośba nie jest potrzebna.");
+        if (type === "CancelRecovery" && !hasPending) throw new Error("Nie ma trwającego odzyskiwania, więc nie ma czego anulować.");
+
+        if (type === "Recovery") {
+          const fingerprint = ethers.keccak256(ethers.concat([message.newOwnerX, message.newOwnerY])).slice(0, 10);
+          show(
+            `<b>Prośba o ODZYSKANIE: zmianę klucza właściciela</b><br>` +
+            `Odcisk nowego klucza: <b>${fingerprint}</b><br>` +
+            `X: <code>${esc(message.newOwnerX)}</code><br>Y: <code>${esc(message.newOwnerY)}</code><br>` +
+            `Numer próby: ${message.nonce}`
+          );
+        } else {
+          show(
+            `<b>Prośba o ANULOWANIE trwającego odzyskiwania</b><br>` +
+            `Odzyskiwanie zostanie przerwane (potrzebny jest też podpis telefonu właściciela).<br>Numer próby: ${message.nonce}`
+          );
+        }
+
+        preparedRequest = { type, message };
+        $("requestWarning").hidden = false;
+        $("signRequest").disabled = false;
+      } catch (e) {
+        show("Błąd: " + esc(e.shortMessage ?? e.message), "err");
+      }
+    };
+
+    $("signRequest").onclick = async () => {
+      if (!preparedRequest) return;
+      try {
+        const { type, message } = preparedRequest;
+        // Domena budowana przez stronę, nie z wklejonego tekstu
+        const domain = { name: "Portfel", version: "1", chainId, verifyingContract: ethers.getAddress(walletParam) };
+
+        // MetaMask pokaże okno z czytelną treścią prośby
+        const signature = await signer.signTypedData(domain, { [type]: REQUEST_TYPES[type] }, message);
+
+        $("requestOutput").value = signature; // aplikacja oczekuje samego podpisu (0x…, 65 bajtów)
+        $("requestResult").hidden = false;
+        $("signRequest").disabled = true;
+      } catch (e) {
+        $("summary").innerHTML = "Podpis anulowany lub błąd: " + esc(e.shortMessage ?? e.message);
+        $("summary").className = "box err";
+        $("summary").hidden = false;
+      }
+    };
+
+    $("copyRequest").onclick = () => navigator.clipboard.writeText($("requestOutput").value);
+  </script>
+</body>
+</html>
